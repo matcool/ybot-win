@@ -1,20 +1,46 @@
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Read};
 use std::io::prelude::*;
 use std::io;
 use std::process::Command;
+extern crate kernel32;
+extern crate winapi;
 
-const BASE_ADDRESS: u32 = 0x36831F8;
+use std::mem;
+use std::os::windows::io::{AsRawHandle, RawHandle};
+use std::process::Child;
+use std::ptr;
+use std::os::raw::c_void;
 
-pub fn get_process_pid(process_name: &str) -> Result<u32, Box<dyn std::error::Error>> {
-    let mut pid = Command::new("pidof").arg(process_name).output()?.stdout;
-    pid.pop();
-    Ok(std::str::from_utf8(&pid)?.parse()?)
+use winapi::um::{tlhelp32, handleapi};
+use winapi::shared::minwindef::*;
+
+const BASE_ADDRESS: u32 = 0x3222D0;
+
+pub fn get_process_pid(process_name: &str) -> Result<u32, &str> {
+    // let mut pid = Command::new("pidof").arg(process_name).output()?.stdout;
+    // pid.pop();
+    // Ok(std::str::from_utf8(&pid)?.parse()?)
+    // unsafe { // blame windows, everything is unsafe
+    //     let handle = kernel32::CreateToolhelp32Snapshot(tlhelp32::TH32CS_SNAPPROCESS, 0);
+    //     if handle == handleapi::INVALID_HANDLE_VALUE {
+    //         return Err("Lol")
+    //     };
+    //     let mut pe32: tlhelp32::PROCESSENTRY32 = Default::default();
+    //     pe32.dwSize = mem::size_of::<tlhelp32::PROCESSENTRY32>() as u32;
+    //     if kernel32::Process32First(handle, (&mut pe32) as *mut tlhelp32::PROCESSENTRY32) == 0 {
+    //         return Err("Lol2")
+    //     };
+    //     while kernel32::Process32Next(handle, (&mut pe32) as *mut tlhelp32::PROCESSENTRY32) != 0 {
+    //         if process_name == pe32.szExeFile.to_string() {
+    //             Ok(pe32.th32ProcessID);
+    //         };
+    //     }
+    //     return Err("Not found")
+    // }
+    Ok(3764)
 }
 
 pub struct GDMemory {
-    mem: File,
+    handle: RawHandle,
     last_x_pos_address: u32,
     last_y_pos_address: u32,
     last_is_dead_address: u32,
@@ -23,13 +49,20 @@ pub struct GDMemory {
 
 impl GDMemory {
     pub fn from_pid(pid: u32) -> io::Result<Self> {
-        Ok(Self {
-            mem: OpenOptions::new().read(true).write(true).open(format!("/proc/{}/mem", pid))?,
-            last_x_pos_address: 0,
-            last_y_pos_address: 0,
-            last_is_dead_address: 0,
-            last_is_practice_mode_address: 0,
-        })
+        let handle = unsafe {
+            kernel32::OpenProcess(0x0010 | 0x0020, 0, pid)
+        };
+        if handle == (0 as RawHandle) {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Self {
+                handle: handle,
+                last_x_pos_address: 0,
+                last_y_pos_address: 0,
+                last_is_dead_address: 0,
+                last_is_practice_mode_address: 0,
+            })
+        }
     }
 
     pub fn get_addr(&mut self, mut base: u32, offsets: Vec<u32>) -> io::Result<u32> {
@@ -41,30 +74,54 @@ impl GDMemory {
         Ok(base)
     }
 
+    pub fn read_buf(&self, addr: u32, buf: &mut [u8]) -> io::Result<()> {
+        if unsafe {
+            kernel32::ReadProcessMemory(self.handle,
+                                        addr as *mut c_void,
+                                        buf.as_mut_ptr() as *mut c_void,
+                                        mem::size_of_val(buf) as u64,
+                                        ptr::null_mut())
+        } == FALSE {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn write_buf(&self, addr: u32, buf: &[u8]) -> io::Result<()> {
+        if unsafe {
+            kernel32::WriteProcessMemory(self.handle,
+                                        addr as *mut c_void,
+                                        buf.as_ptr() as *const c_void,
+                                        mem::size_of_val(buf) as u64,
+                                        ptr::null_mut())
+        } == FALSE {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn read_int(&mut self, addr: u32) -> io::Result<u32> {
-        self.mem.seek(SeekFrom::Start(addr as u64))?;
         let mut buffer = [0; 4];
-        self.mem.read_exact(&mut buffer)?;
+        self.read_buf(addr, &mut buffer)?;
         Ok(u32::from_le_bytes(buffer))
     }
 
     pub fn read_float(&mut self, addr: u32) -> io::Result<f32> {
-        self.mem.seek(SeekFrom::Start(addr as u64))?;
         let mut buffer = [0; 4];
-        self.mem.read_exact(&mut buffer)?;
+        self.read_buf(addr, &mut buffer)?;
         Ok(f32::from_le_bytes(buffer))
     }
 
     pub fn write_float(&mut self, addr: u32, val: f32) -> io::Result<()> {
-        self.mem.seek(SeekFrom::Start(addr as u64))?;
-        self.mem.write(&val.to_le_bytes())?;
+        self.write_buf(addr, &val.to_le_bytes())?;
         Ok(())
     }
 
     pub fn read_bool(&mut self, addr: u32) -> io::Result<bool> {
-        self.mem.seek(SeekFrom::Start(addr as u64))?;
         let mut buffer = [0];
-        self.mem.read_exact(&mut buffer)?;
+        self.read_buf(addr, &mut buffer)?;
         Ok(buffer[0] != 0)
     }
 
